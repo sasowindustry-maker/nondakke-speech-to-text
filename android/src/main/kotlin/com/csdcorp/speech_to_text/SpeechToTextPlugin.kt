@@ -133,11 +133,13 @@ public class SpeechToTextPlugin :
     private val defaultLanguageTag: String = Locale.getDefault().toLanguageTag()
     private var timer: Timer? = null
     private lateinit var timerTask: TimerTask
+    private var recognizerCleanupTimer: Timer? = null
 
     private val onDeviceReady = "ready"
     private val onDeviceUnavailable = "unavailable"
     private val onDevicePendingDownload = "pending_download"
     private val onDeviceUnsupported = "unsupported"
+    private val recognizerTerminationGraceMillis = 1000L
 
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
 
@@ -291,6 +293,9 @@ public class SpeechToTextPlugin :
     private fun startListening(result: Result, languageTag: String, partialResults: Boolean,
                                listenModeIndex: Int, onDevice: Boolean, pauseFor: Int?) {
         if (sdkVersionTooLow() || isNotInitialized() || isListening()) {
+            if (isListening()) {
+                sendError("error_recognizer_busy")
+            }
             result.success(false)
             return
         }
@@ -309,17 +314,26 @@ public class SpeechToTextPlugin :
         val listenMode = enumValues<ListenMode>()[listenModeIndex]
 
         resultSent = false
-        createRecognizer(listenMode, pauseFor)
+        if (!createRecognizer()) {
+            sendError("error_recognizer_not_available")
+            result.success(false)
+            return
+        }
         minRms = 1000.0F
         maxRms = -100.0F
         debugLog("Start listening")
 
         optionallyStartBluetooth()
-        setupRecognizerIntent(languageTag, partialResults, listenMode, true, pauseFor )
-        handler.post {
-            run {
-                speechRecognizer?.startListening(recognizerIntent)
-            }
+        setupRecognizerIntent(languageTag, partialResults, listenMode, true, pauseFor)
+        try {
+            speechRecognizer?.startListening(recognizerIntent)
+                ?: throw IllegalStateException("Speech recognizer unexpectedly null")
+        } catch (exception: Exception) {
+            Log.e(logTag, "Unable to start on-device recognition", exception)
+            sendError("error_recognizer_not_available")
+            finishRecognitionSession()
+            result.success(false)
+            return
         }
         speechStartTime = System.currentTimeMillis()
         notifyListening(isRecording = true)
@@ -356,10 +370,8 @@ public class SpeechToTextPlugin :
                 speechRecognizer?.stopListening()
             }
         }
-        if ( !recognizerStops ) {
-            destroyRecognizer()
-        }
         notifyListening(isRecording = false)
+        scheduleRecognizerCleanup()
         result.success(true)
         debugLog("Stop listening done")
     }
@@ -375,10 +387,8 @@ public class SpeechToTextPlugin :
                 speechRecognizer?.cancel()
             }
         }
-        if ( !recognizerStops ) {
-            destroyRecognizer()
-        }
         notifyListening(isRecording = false)
+        destroyRecognizer()
         result.success(true)
         debugLog("Cancel listening done")
     }
@@ -662,34 +672,32 @@ public class SpeechToTextPlugin :
         bluetoothAdapter?.getProfileProxy(pluginContext, mProfileListener, BluetoothProfile.HEADSET)
     }
 
-    private fun createRecognizer(listenMode: ListenMode, pauseFor: Int?) {
+    /**
+     * The readiness callback is dispatched on the main handler.  Constructing
+     * and starting in that same turn prevents Android 16/17 from receiving a
+     * queued start before the on-device recognizer has been assigned.
+     */
+    private fun createRecognizer(): Boolean {
         if ( null != speechRecognizer && lastOnDevice ) {
-            return
+            return true
         }
         lastOnDevice = true
         speechRecognizer?.destroy()
         speechRecognizer = null
-        handler.post {
-            run {
-                debugLog("Creating recognizer")
-                val localContext = pluginContext
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && localContext != null &&
-                    SpeechRecognizer.isOnDeviceRecognitionAvailable(localContext)) {
-                    speechRecognizer = createOnDeviceSpeechRecognizer(localContext).apply {
-                        debugLog("Setting on-device listener")
-                        setRecognitionListener(this@SpeechToTextPlugin)
-                    }
-                }
-                if (null == speechRecognizer) {
-                    Log.e(logTag, "Speech recognizer null")
-                    activeResult?.error(
-                        SpeechToTextErrors.recognizerNotAvailable.name,
-                        "Speech recognizer null", ""
-                    )
-                    activeResult = null
-                }
+        debugLog("Creating recognizer")
+        val localContext = pluginContext
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && localContext != null &&
+            SpeechRecognizer.isOnDeviceRecognitionAvailable(localContext)) {
+            speechRecognizer = createOnDeviceSpeechRecognizer(localContext).apply {
+                debugLog("Setting on-device listener")
+                setRecognitionListener(this@SpeechToTextPlugin)
             }
         }
+        if (null == speechRecognizer) {
+            Log.e(logTag, "Speech recognizer null")
+            return false
+        }
+        return true
     }
 
     private fun setupRecognizerIntent(languageTag: String, partialResults: Boolean, listenMode: ListenMode, onDevice: Boolean, pauseFor: Int? ) {
@@ -702,9 +710,7 @@ public class SpeechToTextPlugin :
             previousPartialResults = partialResults
             previousListenMode = listenMode
             previousPauseFor = pauseFor
-            handler.post {
-                run {
-                    recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                         debugLog("In RecognizerIntent apply")
                         if (listenMode == ListenMode.search) {
                             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_WEB_SEARCH)
@@ -733,21 +739,40 @@ public class SpeechToTextPlugin :
                         pauseFor?.also {
                             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, it)
                         }
-                    }
-                }
             }
         }
     }
 
     private fun destroyRecognizer() {
+        recognizerCleanupTimer?.cancel()
+        recognizerCleanupTimer = null
+        debugLog("Recognizer destroy")
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        lastOnDevice = false
+    }
 
-        handler.postDelayed( {
-                run {
-                    debugLog("Recognizer destroy")
-                    speechRecognizer?.destroy();
-                    speechRecognizer = null;
+    /**
+     * stopListening is allowed to deliver one final result.  If an Android
+     * service omits that terminal callback, release the microphone and native
+     * recognizer after one bounded grace period instead of retaining it.
+     */
+    private fun scheduleRecognizerCleanup() {
+        recognizerCleanupTimer?.cancel()
+        recognizerCleanupTimer = Timer().apply {
+            schedule(object : TimerTask() {
+                override fun run() {
+                    handler.post { finishRecognitionSession() }
                 }
-        }, 50 )
+            }, recognizerTerminationGraceMillis)
+        }
+    }
+
+    private fun finishRecognitionSession() {
+        if (isListening()) {
+            notifyListening(isRecording = false)
+        }
+        destroyRecognizer()
     }
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean {
         when (requestCode) {
@@ -766,7 +791,10 @@ public class SpeechToTextPlugin :
 
 
     override fun onPartialResults(results: Bundle?) = updateResults(results, false)
-    override fun onResults(results: Bundle?) = updateResults(results, true)
+    override fun onResults(results: Bundle?) {
+        updateResults(results, true)
+        finishRecognitionSession()
+    }
     override fun onBeginningOfSpeech() {
         if (timer != null) {
             timer?.cancel()
@@ -780,9 +808,7 @@ public class SpeechToTextPlugin :
                 override fun run() {
                     timer = null
                     handler.post {
-                        run {
-                            notifyListening(isRecording = false)
-                        }
+                        finishRecognitionSession()
                     }
                 }
             }
@@ -817,9 +843,7 @@ public class SpeechToTextPlugin :
         }
 
         sendError(errorMsg)
-        if ( isListening()) {
-            notifyListening(false)
-        }
+        finishRecognitionSession()
     }
 
     private fun debugLog( msg: String ) {
@@ -832,11 +856,7 @@ public class SpeechToTextPlugin :
         val speechError = JSONObject()
         speechError.put("errorMsg", errorMsg)
         speechError.put("permanent", true)
-        handler.post {
-            run {
-                channel?.invokeMethod(SpeechToTextCallbackMethods.notifyError.name, speechError.toString())
-            }
-        }
+        channel?.invokeMethod(SpeechToTextCallbackMethods.notifyError.name, speechError.toString())
     }
 
     override fun onRmsChanged(rmsdB: Float) {
